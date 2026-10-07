@@ -150,11 +150,13 @@ def patch_vsix(entry, directory):
 
 
 def existing_release(repo, tag):
-    result = subprocess.run(["gh", "api", f"repos/{repo}/releases/tags/{tag}"],
-                            text=True, capture_output=True)
+    # gh release view also finds drafts; the REST by-tag endpoint misses them.
+    result = subprocess.run(["gh", "release", "view", tag, "--repo", repo,
+                             "--json", "isDraft,assets"], text=True, capture_output=True)
     if result.returncode == 0:
-        return json.loads(result.stdout)
-    if "HTTP 404" in result.stderr:
+        release = json.loads(result.stdout)
+        return {"draft": release["isDraft"], "assets": release["assets"]}
+    if "release not found" in result.stderr.lower() or "HTTP 404" in result.stderr:
         return None
     raise RuntimeError(result.stderr)
 
