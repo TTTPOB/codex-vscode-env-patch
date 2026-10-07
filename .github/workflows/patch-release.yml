@@ -1,0 +1,41 @@
+name: Codex environment variable patch
+
+on:
+  schedule:
+    # 02:00 Asia/Shanghai = 18:00 UTC on the previous day.
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Exact Marketplace version (blank = latest in selected channel)"
+        type: string
+        required: false
+      channel:
+        description: "Marketplace channel (ignored when version is specified)"
+        type: choice
+        options:
+          - stable
+          - prerelease
+        default: stable
+
+permissions:
+  contents: write
+
+concurrency:
+  group: codex-environment-variable-patch
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REQUESTED_VERSION: ${{ inputs.version }}
+      CHANNEL: ${{ inputs.channel || 'stable' }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Test scoped patch and DEBUG behavior
+        run: python3 patch_release.py --self-test
+      - name: Check Marketplace, patch all platforms and publish release
+        run: python3 patch_release.py --version "$REQUESTED_VERSION" --channel "$CHANNEL"
