@@ -19,23 +19,83 @@ on:
         default: stable
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: codex-environment-variable-patch
   cancel-in-progress: false
 
 jobs:
-  release:
+  prepare:
+    name: Resolve version and test patch logic
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 5
+    outputs:
+      skip: ${{ steps.plan.outputs.skip }}
+      matrix: ${{ steps.plan.outputs.matrix }}
     env:
       GH_TOKEN: ${{ github.token }}
       REQUESTED_VERSION: ${{ inputs.version }}
       CHANNEL: ${{ inputs.channel || 'stable' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Test scoped patch and DEBUG behavior
+      - name: Test defect detection, scoped matching and idempotence
         run: python3 patch_release.py --self-test
-      - name: Check Marketplace, patch all platforms and publish release
-        run: python3 patch_release.py --version "$REQUESTED_VERSION" --channel "$CHANNEL"
+      - name: Pin Marketplace version and platform download URLs
+        id: plan
+        run: python3 patch_release.py --prepare plan.json --version "$REQUESTED_VERSION" --channel "$CHANNEL"
+      - uses: actions/upload-artifact@v4
+        if: steps.plan.outputs.skip != 'true'
+        with:
+          name: release-plan
+          path: plan.json
+          retention-days: 1
+
+  patch:
+    name: Patch and test ${{ matrix.platform }}
+    needs: prepare
+    if: needs.prepare.outputs.skip != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    env:
+      PLATFORM: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-plan
+      - name: Download, patch and test actual VSIX
+        run: python3 patch_release.py --build-only --plan-file plan.json --platform "$PLATFORM"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: patched-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  publish:
+    name: Publish validated platform assets
+    needs: [prepare, patch]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-plan
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: patched-*
+          path: dist
+          merge-multiple: true
+      - name: Check complete asset set and publish
+        run: python3 patch_release.py --publish-only --plan-file plan.json
