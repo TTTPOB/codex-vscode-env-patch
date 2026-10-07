@@ -11,7 +11,7 @@ on:
         type: string
         required: false
       version:
-        description: "Exact Marketplace version (blank = latest in selected channel)"
+        description: "Exact Marketplace version, including historical versions (blank = latest in selected channel)"
         type: string
         required: false
       channel:
@@ -45,7 +45,9 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Test defect detection, scoped matching and idempotence
-        run: python3 patch_release.py --self-test
+        run: |
+          python3 patch_release.py --self-test
+          python3 -m unittest test_patch_release.py
       - name: Pin Marketplace version and platform download URLs
         id: plan
         run: python3 patch_release.py --prepare plan.json --version "$REQUESTED_VERSION" --channel "$CHANNEL"

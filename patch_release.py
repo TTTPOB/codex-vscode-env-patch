@@ -166,12 +166,12 @@ def asset_name(entry):
     return f"openai.chatgpt-{entry['version']}-{platform}-environment-variable-patch.vsix"
 
 
-def prepare(entries, repo, path):
+def prepare(entries, repo, path, latest=True):
     previous = existing_release(repo, f"{entries[0]['version']}-environment-variable-patch")
     names = {a["name"] for a in previous["assets"]} if previous else set()
     skip = bool(previous and not previous["draft"]
                 and {asset_name(e) for e in entries} <= names)
-    plan = {"entries": entries, "skip": skip}
+    plan = {"entries": entries, "skip": skip, "latest": latest}
     path.write_text(json.dumps(plan), encoding="utf-8")
     matrix = {"platform": [e.get("targetPlatform") or "universal" for e in entries]}
     if os.environ.get("GITHUB_OUTPUT"):
@@ -181,7 +181,7 @@ def prepare(entries, repo, path):
     print(f"Plan: {entries[0]['version']}, {len(entries)} platforms, skip={skip}")
 
 
-def publish(entries, repo, directory):
+def publish(entries, repo, directory, latest=True):
     version = entries[0]["version"]
     tag = f"{version}-environment-variable-patch"
     expected = {asset_name(e) for e in entries}
@@ -218,7 +218,9 @@ def publish(entries, repo, directory):
     if missing:
         gh("release", "upload", tag, *missing, "--repo", repo)
     if not previous or previous["draft"]:
-        gh("release", "edit", tag, "--repo", repo, "--notes", notes, "--draft=false")
+        # Historical builds must not replace the release used by latest installers.
+        gh("release", "edit", tag, "--repo", repo, "--notes", notes, "--draft=false",
+           *([] if latest else ["--latest=false"]))
     print(f"Published https://github.com/{repo}/releases/tag/{tag}")
 
 def self_test():
@@ -269,7 +271,7 @@ def main():
     entries = (json.loads(args.plan_file.read_text(encoding="utf-8"))["entries"] if args.plan_file
                else select_versions(marketplace_versions(), args.version, args.channel))
     if args.prepare:
-        prepare(entries, args.repo, args.prepare)
+        prepare(entries, args.repo, args.prepare, latest=not bool(args.version))
         return
     if args.platform:
         entries = [e for e in entries if (e.get("targetPlatform") or "universal") == args.platform]
@@ -281,7 +283,8 @@ def main():
         for entry in entries:
             patch_vsix(entry, args.output)
     else:
-        publish(entries, args.repo, args.output)
+        plan = json.loads(args.plan_file.read_text(encoding="utf-8"))
+        publish(entries, args.repo, args.output, latest=plan.get("latest", True))
 
 
 if __name__ == "__main__":
