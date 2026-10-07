@@ -48,6 +48,7 @@ jobs:
         run: |
           python3 patch_release.py --self-test
           python3 -m unittest test_patch_release.py
+          python3 scripts/test_update_vscode_codex_ext.py
       - name: Pin Marketplace version and platform download URLs
         id: plan
         run: python3 patch_release.py --prepare plan.json --version "$REQUESTED_VERSION" --channel "$CHANNEL"
