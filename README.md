@@ -33,15 +33,17 @@ bash scripts/update-vscode-codex-ext.sh --version 26.917.62051
 
 指定版本也可使用 `EXTENSION_VERSION` 环境变量。运行 `--help` 查看目录及 CLI 覆盖参数。
 
-升级脚本从本仓库 Release 下载对应 Linux x64 patched VSIX；指定版本未发布时提示构建命令，不回退到未修补的 Marketplace 包。扩展版本独立于 Codex 运行时版本：两种安装模式都选择 `TTTPOB/codex` 最新可用的正式 `nfs-rust-v*` 发布包，并配套同版本的官方 `codex-code-mode-host`。
+升级脚本从本仓库 Release 下载对应 Linux x64 patched VSIX；指定版本未发布时提示构建命令，不回退到未修补的 Marketplace 包。扩展版本独立于 Codex 运行时版本：两种安装模式都选择 `TTTPOB/codex` 中版本号最高、带有目标附件的正式 `nfs-rust-vX.Y.Z` 发布，排除 draft 和 prerelease。附件名为 `codex-nfs-rust-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz`。
 
-运行时安装到 `~/.local/bin`：
+完整运行时保存到 `~/.local/bin/codex-packages/nfs-rust-vX.Y.Z/`（可用 `LOCAL_BIN_DIR` 改变根目录），保留包内 `codex-package.json`、`bin/codex`、`bin/codex-code-mode-host`、`codex-path/` 和 `codex-resources/`。CLI 和 daemon 按真实 executable 路径寻找包资源，因此不能单独复制二进制。只含裸二进制的旧附件会在安装 VSIX 前明确报错。
 
-- `codex`：NFS 修复版二进制。
-- `codex-code-mode-host`：与该二进制同版本的官方 host。
-- `codex_`：启动快速失败时重试的 wrapper。
+`~/.local/bin` 中的入口：
 
-扩展中的 `bin/linux-x86_64/codex` 指向 `codex_`，原始扩展二进制保存在同目录的 `codex-orig`。扩展自带 `codex-package.json` 的版本只作参考，不限制替换版本；旧扩展缺少该元数据不妨碍安装。
+- `codex`：指向完整包内的 NFS 修复版 CLI。
+- `codex-code-mode-host`：指向同一个包内的 host。
+- `codex_`：启动快速失败时重试的 wrapper，直接运行包内 CLI。
+
+扩展中的 `bin/linux-x86_64/codex` 指向 `codex_`，host 指向完整包内的 host；原始扩展二进制保存在同目录的 `codex-orig`。扩展自带 `codex-package.json` 的版本只作参考，不限制替换版本；旧扩展缺少该元数据不妨碍安装。不同版本的完整包保留在各自目录，重复安装同一版本会更新该目录。
 
 升级后重新加载 VSCode 窗口。需在扩展菜单中关闭 Codex 的自动更新，避免 Marketplace 覆盖 patched VSIX。扩展与独立运行时的实际兼容性、模型选择器和 queue/steer 行为需要在 VSCode 中验证。
 

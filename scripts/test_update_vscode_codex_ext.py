@@ -100,10 +100,7 @@ class UpdaterTest(unittest.TestCase):
             if version == LATEST:
                 self.api['TTTPOB/codex-vscode-env-patch/releases/latest'] = release
         fork_name = f'codex-nfs-rust-v{RUNTIME}-x86_64-unknown-linux-musl.tar.gz'
-        host_name = 'codex-code-mode-host-x86_64-unknown-linux-musl.tar.gz'
-        self.tar(fork_name, 'codex', f'#!/bin/sh\ntouch "$MOCK_ROOT/runtime-probed"\necho "codex-cli {RUNTIME}"\n')
-        self.tar(host_name, 'codex-code-mode-host-x86_64-unknown-linux-musl',
-                 '#!/bin/sh\ntouch "$MOCK_ROOT/host-probed"\nexit 0\n')
+        self.package(fork_name)
         valid = {'tag_name': 'nfs-rust-v' + RUNTIME, 'published_at': '2026-09-20',
                  'assets': [self.asset(fork_name)]}
         older_name = 'codex-nfs-rust-v0.1.0-x86_64-unknown-linux-musl.tar.gz'
@@ -113,13 +110,34 @@ class UpdaterTest(unittest.TestCase):
         self.api['TTTPOB/codex/releases?per_page=100&page=1'] = [
             {**valid, 'tag_name': 'rust-v9.0.0'}, {**valid, 'prerelease': True},
             {**valid, 'draft': True}, older, valid]
-        self.api['openai/codex/releases/tags/rust-v' + RUNTIME] = {
-            'tag_name': 'rust-v' + RUNTIME, 'assets': [self.asset(host_name)]}
 
     def asset(self, name):
         digest = hashlib.sha256((self.root / 'assets' / name).read_bytes()).hexdigest()
         return {'name': name, 'browser_download_url': 'https://fixtures/' + name,
                 'digest': 'sha256:' + digest}
+
+    def package(self, name):
+        # Resolve symlinks like InstallContext; fail if resources were left behind.
+        probe = ('#!/usr/bin/env python3\n'
+                 'import json, os, pathlib\n'
+                 'root = pathlib.Path(__file__).resolve().parent.parent\n'
+                 f'assert json.loads((root / "codex-package.json").read_text())["version"] == "{RUNTIME}"\n'
+                 'assert (root / "codex-path/rg").read_text() == "fixture rg"\n'
+                 'assert (root / "codex-resources/runtime-data").read_text() == "fixture resource"\n')
+        files = {
+            'bin/codex': probe + f'pathlib.Path(os.environ["MOCK_ROOT"], "runtime-probed").touch()\nprint("codex-cli {RUNTIME}")\n',
+            'bin/codex-code-mode-host': probe + 'pathlib.Path(os.environ["MOCK_ROOT"], "host-probed").touch()\n',
+            'codex-package.json': json.dumps({'layoutVersion': 1, 'version': RUNTIME}),
+            'codex-path/rg': 'fixture rg',
+            'codex-resources/runtime-data': 'fixture resource',
+        }
+        with tarfile.open(self.root / 'assets' / name, 'w:gz') as archive:
+            for path, content in files.items():
+                data = content.encode()
+                info = tarfile.TarInfo(path)
+                info.size = len(data)
+                info.mode = 0o755 if path.startswith('bin/') else 0o644
+                archive.addfile(info, io.BytesIO(data))
 
     def tar(self, name, binary, content):
         data = content.encode()
@@ -151,6 +169,13 @@ class UpdaterTest(unittest.TestCase):
                                text=True, capture_output=True)
         self.assertEqual(probe.stdout.strip(), 'codex-cli ' + RUNTIME)
         self.assertEqual(probe.returncode, 0)
+        package = Path(self.env['LOCAL_BIN_DIR']) / 'codex-packages' / ('nfs-rust-v' + RUNTIME)
+        self.assertEqual((Path(self.env['LOCAL_BIN_DIR']) / 'codex').resolve(), package / 'bin/codex')
+        self.assertEqual(local_host.resolve(), package / 'bin/codex-code-mode-host')
+        self.assertEqual(json.loads((package / 'codex-package.json').read_text())['version'], RUNTIME)
+        host_probe = subprocess.run([str(bundle / 'codex-code-mode-host'), '--help'], env=self.env,
+                                    text=True, capture_output=True)
+        self.assertEqual(host_probe.returncode, 0, host_probe.stderr)
         self.assert_clean()
 
     def test_old_version_without_codex_package_and_rerun(self):
@@ -163,7 +188,7 @@ class UpdaterTest(unittest.TestCase):
         self.assert_success(self.run_update(), LATEST)
         requests = (self.root / 'requests').read_text()
         self.assertIn('codex-vscode-env-patch/releases/latest', requests)
-        self.assertIn('openai/codex/releases/tags/rust-v' + RUNTIME, requests)
+        self.assertNotIn('openai/codex/', requests)
         self.assertNotIn('rust-v0.1.0', requests)
 
     def test_runtime_release_pagination(self):
@@ -173,6 +198,21 @@ class UpdaterTest(unittest.TestCase):
         self.api['TTTPOB/codex/releases?per_page=100&page=2'] = [valid]
         self.assert_success(self.run_update(), LATEST)
         self.assertIn('releases?per_page=100&page=2', (self.root / 'requests').read_text())
+
+    def test_runtime_version_not_publication_date(self):
+        key = 'TTTPOB/codex/releases?per_page=100&page=1'
+        self.api[key][-2]['published_at'] = '2099-01-01'
+        self.assert_success(self.run_update(), LATEST)
+
+    def test_bare_binary_archive_rejected_before_install(self):
+        name = f'codex-nfs-rust-v{RUNTIME}-x86_64-unknown-linux-musl.tar.gz'
+        self.tar(name, 'codex', '#!/bin/sh\nexit 0\n')
+        self.api['TTTPOB/codex/releases?per_page=100&page=1'][-1]['assets'] = [self.asset(name)]
+        result = self.run_update()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('complete Codex package', result.stderr)
+        self.assertFalse((self.root / 'code-calls').exists())
+        self.assert_clean()
 
     def test_environment_version(self):
         self.env['EXTENSION_VERSION'] = OLD
@@ -194,7 +234,7 @@ class UpdaterTest(unittest.TestCase):
                 self.assert_clean()
 
     def test_bad_runtime_digest_before_install(self):
-        self.api['openai/codex/releases/tags/rust-v' + RUNTIME]['assets'][0]['digest'] = 'sha256:' + '0' * 64
+        self.api['TTTPOB/codex/releases?per_page=100&page=1'][-1]['assets'][0]['digest'] = 'sha256:' + '0' * 64
         result = self.run_update()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('SHA-256 mismatch', result.stderr)

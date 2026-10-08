@@ -4,7 +4,6 @@ set -Eeuo pipefail
 # Install a pre-patched VSIX and the latest independent NFS-fixed runtime.
 EXTENSION_REPO=TTTPOB/codex-vscode-env-patch
 FORK_REPO=TTTPOB/codex
-UPSTREAM_REPO=openai/codex
 CODE_CMD="${CODE_CMD:-code}"
 LOCAL_BIN_DIR="${LOCAL_BIN_DIR:-$HOME/.local/bin}"
 EXTENSION_VERSION="${EXTENSION_VERSION:-}"
@@ -14,7 +13,7 @@ usage() {
         'Usage: update-vscode-codex-ext.sh [--version VERSION] [--help]' \
         'Download the patched linux-x64 VSIX from TTTPOB/codex-vscode-env-patch.' \
         'Without a version, use GitHub releases/latest. Never use Marketplace.' \
-        'Runtime: latest stable nfs-rust-v* release; use its packaged host when available.' \
+        'Runtime: highest stable nfs-rust-vX.Y.Z release with a complete Codex package.' \
         'Overrides: EXTENSION_VERSION, CODE_CMD, LOCAL_BIN_DIR, EXTENSIONS_DIR,' \
         '           VSCODE_AGENT_FOLDER, TMPDIR, GH_TOKEN.' \
         'Reload the VS Code remote window after updating.'
@@ -28,7 +27,7 @@ while (( $# )); do
     esac
 done
 [[ -z "$EXTENSION_VERSION" || "$EXTENSION_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die 'invalid extension version'
-for cmd in curl python3 tar sha256sum install "$CODE_CMD"; do
+for cmd in curl python3 tar sha256sum install realpath "$CODE_CMD"; do
     command -v "$cmd" >/dev/null || die "required command not found: $cmd"
 done
 [[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]] || die 'Linux x86_64 is required'
@@ -125,7 +124,7 @@ for path in glob.glob(sys.argv[1] + '/releases-*.json'):
             releases.append(release)
 if not releases:
     raise SystemExit('no stable NFS-fixed release with a musl x64 archive')
-latest = max(releases, key=lambda r: (r.get('published_at') or r.get('created_at') or '', tuple(map(int, r['tag_name'][10:].split('.')))))
+latest = max(releases, key=lambda r: tuple(map(int, r['tag_name'][10:].split('.'))))
 print(latest['tag_name'])
 with open(sys.argv[1] + '/fork-release.json', 'w') as output:
     json.dump(latest, output)
@@ -134,97 +133,26 @@ PY
 CODEX_VERSION="${FORK_TAG#nfs-rust-v}"
 echo "NFS runtime: $FORK_TAG"
 asset_info="$(asset "$TMP_DIR/fork-release.json" "codex-${FORK_TAG}-x86_64-unknown-linux-musl.tar.gz")"
-IFS=
-chmod 0755 "$FORK_BINARY" "$HOST_BINARY"
-version_output="$("$FORK_BINARY" --version)"
-[[ "$version_output" == "codex-cli $CODEX_VERSION" ]] || die "unexpected runtime version: $version_output"
-"$HOST_BINARY" --help >/dev/null 2>&1 || die 'code-mode host smoke test failed'
-
-REAL_CODEX="$LOCAL_BIN_DIR/codex"
-RETRY_WRAPPER="$LOCAL_BIN_DIR/codex_"
-{
-    printf '#!/usr/bin/env bash\n# Retry fast NFS startup failures, not long-running crashes.\n'
-    printf 'CODEX_BIN=%q\n' "$REAL_CODEX"
-    printf '%s\n' 'attempt=1' 'while true; do' '    start=$SECONDS' \
-        '    "$CODEX_BIN" "$@"' '    status=$?' \
-        '    (( status != 0 )) || exit 0' \
-        '    (( SECONDS - start < 30 && attempt < 10 )) || exit "$status"' \
-        '    echo "codex startup failed ($status); retrying ($attempt/10)" >&2' \
-        '    sleep 1' '    attempt=$((attempt + 1))' 'done'
-} > "$TMP_DIR/wrapper"
-
-code_cli() {
-    local args=()
-    [[ -z "${EXTENSIONS_DIR:-}" ]] || args+=(--extensions-dir "$EXTENSIONS_DIR")
-    "$CODE_CMD" "${args[@]}" "$@"
-}
-installed_version() {
-    code_cli --list-extensions --show-versions | awk -F@ 'tolower($1)=="openai.chatgpt" {print $2; exit}'
-}
-code_cli --install-extension "$VSIX" --force
-[[ "$(installed_version)" == "$EXT_VERSION" ]] || die "installed extension version is not $EXT_VERSION"
-EXT_DIR="$(python3 - "$EXT_VERSION" <<'PY'
-import json, os, pathlib, sys
-roots = [os.environ['EXTENSIONS_DIR']] if os.environ.get('EXTENSIONS_DIR') else []
-if not roots:
-    if os.environ.get('VSCODE_AGENT_FOLDER'):
-        roots.append(os.environ['VSCODE_AGENT_FOLDER'] + '/extensions')
-    roots += [os.path.expanduser(p) for p in ('~/.vscode-server/extensions', '~/.vscode-server-insiders/extensions', '~/.vscode/extensions')]
-for root in roots:
-    for candidate in sorted(pathlib.Path(root).glob('openai.chatgpt-*'), key=lambda p: not p.name.endswith('-linux-x64')):
-        try:
-            package = json.loads((candidate / 'package.json').read_text())
-        except (OSError, ValueError):
-            continue
-        if (package.get('publisher'), package.get('name'), package.get('version')) == ('openai', 'chatgpt', sys.argv[1]):
-            print(candidate.resolve())
-            raise SystemExit(0)
-raise SystemExit('installed extension directory not found')
-PY
-)"
-BUNDLE_DIR="$EXT_DIR/bin/linux-x86_64"
-[[ -e "$BUNDLE_DIR/codex" ]] || die 'installed extension has no bundled codex'
-# Preserve the pristine extension binary on first replacement, including reruns.
-if [[ ! -e "$BUNDLE_DIR/codex-orig" ]]; then
-    [[ ! -L "$BUNDLE_DIR/codex" ]] || die 'codex is already a symlink without codex-orig'
-    cp -p "$BUNDLE_DIR/codex" "$BUNDLE_DIR/codex-orig"
-fi
-atomic_install() {
-    local source="$1" target="$2"
-    install -m 0755 "$source" "${target}.new.$$"
-    mv -Tf "${target}.new.$$" "$target"
-}
-mkdir -p "$LOCAL_BIN_DIR"
-atomic_install "$FORK_BINARY" "$REAL_CODEX"
-atomic_install "$HOST_BINARY" "$LOCAL_BIN_DIR/codex-code-mode-host"
-atomic_install "$TMP_DIR/wrapper" "$RETRY_WRAPPER"
-atomic_install "$HOST_BINARY" "$BUNDLE_DIR/codex-code-mode-host"
-ln -s "$RETRY_WRAPPER" "$BUNDLE_DIR/.codex-link.$$"
-mv -Tf "$BUNDLE_DIR/.codex-link.$$" "$BUNDLE_DIR/codex"
-[[ "$(readlink "$BUNDLE_DIR/codex")" == "$RETRY_WRAPPER" && -x "$BUNDLE_DIR/codex" ]] || die 'invalid extension runtime symlink'
-echo "Update complete: extension $EXT_VERSION; Codex $CODEX_VERSION."
-echo "Extension: $EXT_DIR"
-echo "Original Codex: $BUNDLE_DIR/codex-orig"
-echo 'Reload the VS Code remote window before using the updated extension.'
-\t' read -r fork_url fork_digest <<< "$asset_info"
+IFS=$'\t' read -r fork_url fork_digest <<< "$asset_info"
 download_verified "$fork_url" "$fork_digest" "$TMP_DIR/fork.tar.gz"
 mkdir "$TMP_DIR/fork"
 tar -xzf "$TMP_DIR/fork.tar.gz" -C "$TMP_DIR/fork"
-
-if [[ -f "$TMP_DIR/fork/bin/codex" && -f "$TMP_DIR/fork/bin/codex-code-mode-host" ]]; then
-    FORK_BINARY="$TMP_DIR/fork/bin/codex"
-    HOST_BINARY="$TMP_DIR/fork/bin/codex-code-mode-host"
-else
-    # Backward compatibility with older fork releases that only shipped codex+bwrap.
-    api "$UPSTREAM_REPO/releases/tags/rust-v$CODEX_VERSION" > "$TMP_DIR/host-release.json"
-    asset_info="$(asset "$TMP_DIR/host-release.json" 'codex-code-mode-host-x86_64-unknown-linux-musl.tar.gz')"
-    IFS=
+PACKAGE_SOURCE="$TMP_DIR/fork"
+[[ -f "$PACKAGE_SOURCE/codex-package.json" &&
+   -f "$PACKAGE_SOURCE/bin/codex" &&
+   -f "$PACKAGE_SOURCE/bin/codex-code-mode-host" &&
+   -d "$PACKAGE_SOURCE/codex-path" &&
+   -d "$PACKAGE_SOURCE/codex-resources" ]] || die 'NFS archive must contain a complete Codex package (not standalone binaries)'
+FORK_BINARY="$PACKAGE_SOURCE/bin/codex"
+HOST_BINARY="$PACKAGE_SOURCE/bin/codex-code-mode-host"
 chmod 0755 "$FORK_BINARY" "$HOST_BINARY"
 version_output="$("$FORK_BINARY" --version)"
 [[ "$version_output" == "codex-cli $CODEX_VERSION" ]] || die "unexpected runtime version: $version_output"
 "$HOST_BINARY" --help >/dev/null 2>&1 || die 'code-mode host smoke test failed'
 
-REAL_CODEX="$LOCAL_BIN_DIR/codex"
+LOCAL_BIN_DIR="$(realpath -m "$LOCAL_BIN_DIR")"
+PACKAGE_DIR="$LOCAL_BIN_DIR/codex-packages/$FORK_TAG"
+REAL_CODEX="$PACKAGE_DIR/bin/codex"
 RETRY_WRAPPER="$LOCAL_BIN_DIR/codex_"
 {
     printf '#!/usr/bin/env bash\n# Retry fast NFS startup failures, not long-running crashes.\n'
@@ -273,104 +201,22 @@ if [[ ! -e "$BUNDLE_DIR/codex-orig" ]]; then
     [[ ! -L "$BUNDLE_DIR/codex" ]] || die 'codex is already a symlink without codex-orig'
     cp -p "$BUNDLE_DIR/codex" "$BUNDLE_DIR/codex-orig"
 fi
-atomic_install() {
+# Keep binaries and their runtime-relative resources together.
+mkdir -p "$LOCAL_BIN_DIR/codex-packages"
+PACKAGE_STAGE="$LOCAL_BIN_DIR/codex-packages/.new.$$"
+cp -a "$PACKAGE_SOURCE" "$PACKAGE_STAGE"
+rm -rf "$PACKAGE_DIR"
+mv "$PACKAGE_STAGE" "$PACKAGE_DIR"
+install -m 0755 "$TMP_DIR/wrapper" "$RETRY_WRAPPER"
+install_link() {
     local source="$1" target="$2"
-    install -m 0755 "$source" "${target}.new.$$"
+    ln -s "$source" "${target}.new.$$"
     mv -Tf "${target}.new.$$" "$target"
 }
-mkdir -p "$LOCAL_BIN_DIR"
-atomic_install "$FORK_BINARY" "$REAL_CODEX"
-atomic_install "$HOST_BINARY" "$LOCAL_BIN_DIR/codex-code-mode-host"
-atomic_install "$TMP_DIR/wrapper" "$RETRY_WRAPPER"
-atomic_install "$HOST_BINARY" "$BUNDLE_DIR/codex-code-mode-host"
-ln -s "$RETRY_WRAPPER" "$BUNDLE_DIR/.codex-link.$$"
-mv -Tf "$BUNDLE_DIR/.codex-link.$$" "$BUNDLE_DIR/codex"
-[[ "$(readlink "$BUNDLE_DIR/codex")" == "$RETRY_WRAPPER" && -x "$BUNDLE_DIR/codex" ]] || die 'invalid extension runtime symlink'
-echo "Update complete: extension $EXT_VERSION; Codex $CODEX_VERSION."
-echo "Extension: $EXT_DIR"
-echo "Original Codex: $BUNDLE_DIR/codex-orig"
-echo 'Reload the VS Code remote window before using the updated extension.'
-\t' read -r host_url host_digest <<< "$asset_info"
-    download_verified "$host_url" "$host_digest" "$TMP_DIR/host.tar.gz"
-    mkdir "$TMP_DIR/host"
-    tar -xzf "$TMP_DIR/host.tar.gz" -C "$TMP_DIR/host"
-    FORK_BINARY="$TMP_DIR/fork/codex"
-    HOST_BINARY="$(python3 - "$TMP_DIR/host" <<'PY'
-import pathlib, sys
-files = [p for p in pathlib.Path(sys.argv[1]).rglob('codex-code-mode-host*') if p.is_file() and not p.name.endswith('.sigstore')]
-if len(files) != 1:
-    raise SystemExit('expected one code-mode host binary')
-print(files[0])
-PY
-)"
-fi
-[[ -f "$FORK_BINARY" ]] || die 'NFS archive has no codex binary'
-chmod 0755 "$FORK_BINARY" "$HOST_BINARY"
-version_output="$("$FORK_BINARY" --version)"
-[[ "$version_output" == "codex-cli $CODEX_VERSION" ]] || die "unexpected runtime version: $version_output"
-"$HOST_BINARY" --help >/dev/null 2>&1 || die 'code-mode host smoke test failed'
-
-REAL_CODEX="$LOCAL_BIN_DIR/codex"
-RETRY_WRAPPER="$LOCAL_BIN_DIR/codex_"
-{
-    printf '#!/usr/bin/env bash\n# Retry fast NFS startup failures, not long-running crashes.\n'
-    printf 'CODEX_BIN=%q\n' "$REAL_CODEX"
-    printf '%s\n' 'attempt=1' 'while true; do' '    start=$SECONDS' \
-        '    "$CODEX_BIN" "$@"' '    status=$?' \
-        '    (( status != 0 )) || exit 0' \
-        '    (( SECONDS - start < 30 && attempt < 10 )) || exit "$status"' \
-        '    echo "codex startup failed ($status); retrying ($attempt/10)" >&2' \
-        '    sleep 1' '    attempt=$((attempt + 1))' 'done'
-} > "$TMP_DIR/wrapper"
-
-code_cli() {
-    local args=()
-    [[ -z "${EXTENSIONS_DIR:-}" ]] || args+=(--extensions-dir "$EXTENSIONS_DIR")
-    "$CODE_CMD" "${args[@]}" "$@"
-}
-installed_version() {
-    code_cli --list-extensions --show-versions | awk -F@ 'tolower($1)=="openai.chatgpt" {print $2; exit}'
-}
-code_cli --install-extension "$VSIX" --force
-[[ "$(installed_version)" == "$EXT_VERSION" ]] || die "installed extension version is not $EXT_VERSION"
-EXT_DIR="$(python3 - "$EXT_VERSION" <<'PY'
-import json, os, pathlib, sys
-roots = [os.environ['EXTENSIONS_DIR']] if os.environ.get('EXTENSIONS_DIR') else []
-if not roots:
-    if os.environ.get('VSCODE_AGENT_FOLDER'):
-        roots.append(os.environ['VSCODE_AGENT_FOLDER'] + '/extensions')
-    roots += [os.path.expanduser(p) for p in ('~/.vscode-server/extensions', '~/.vscode-server-insiders/extensions', '~/.vscode/extensions')]
-for root in roots:
-    for candidate in sorted(pathlib.Path(root).glob('openai.chatgpt-*'), key=lambda p: not p.name.endswith('-linux-x64')):
-        try:
-            package = json.loads((candidate / 'package.json').read_text())
-        except (OSError, ValueError):
-            continue
-        if (package.get('publisher'), package.get('name'), package.get('version')) == ('openai', 'chatgpt', sys.argv[1]):
-            print(candidate.resolve())
-            raise SystemExit(0)
-raise SystemExit('installed extension directory not found')
-PY
-)"
-BUNDLE_DIR="$EXT_DIR/bin/linux-x86_64"
-[[ -e "$BUNDLE_DIR/codex" ]] || die 'installed extension has no bundled codex'
-# Preserve the pristine extension binary on first replacement, including reruns.
-if [[ ! -e "$BUNDLE_DIR/codex-orig" ]]; then
-    [[ ! -L "$BUNDLE_DIR/codex" ]] || die 'codex is already a symlink without codex-orig'
-    cp -p "$BUNDLE_DIR/codex" "$BUNDLE_DIR/codex-orig"
-fi
-atomic_install() {
-    local source="$1" target="$2"
-    install -m 0755 "$source" "${target}.new.$$"
-    mv -Tf "${target}.new.$$" "$target"
-}
-mkdir -p "$LOCAL_BIN_DIR"
-atomic_install "$FORK_BINARY" "$REAL_CODEX"
-atomic_install "$HOST_BINARY" "$LOCAL_BIN_DIR/codex-code-mode-host"
-atomic_install "$TMP_DIR/wrapper" "$RETRY_WRAPPER"
-atomic_install "$HOST_BINARY" "$BUNDLE_DIR/codex-code-mode-host"
-ln -s "$RETRY_WRAPPER" "$BUNDLE_DIR/.codex-link.$$"
-mv -Tf "$BUNDLE_DIR/.codex-link.$$" "$BUNDLE_DIR/codex"
+install_link "$REAL_CODEX" "$LOCAL_BIN_DIR/codex"
+install_link "$PACKAGE_DIR/bin/codex-code-mode-host" "$LOCAL_BIN_DIR/codex-code-mode-host"
+install_link "$PACKAGE_DIR/bin/codex-code-mode-host" "$BUNDLE_DIR/codex-code-mode-host"
+install_link "$RETRY_WRAPPER" "$BUNDLE_DIR/codex"
 [[ "$(readlink "$BUNDLE_DIR/codex")" == "$RETRY_WRAPPER" && -x "$BUNDLE_DIR/codex" ]] || die 'invalid extension runtime symlink'
 echo "Update complete: extension $EXT_VERSION; Codex $CODEX_VERSION."
 echo "Extension: $EXT_DIR"
