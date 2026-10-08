@@ -1,6 +1,6 @@
 # Codex VSCode environment patch
 
-发布修复 `DEBUG=release` 环境污染的 Codex VSIX，并提供 Linux x86_64 远端扩展升级脚本。补丁只修正扩展 bundle 中 `debug` 包的 save/load 函数；扩展标识、版本和其他打包内容保持不变。
+发布修复 `DEBUG=release` 环境污染的 Codex VSIX，并提供 Linux NFS 修复版和 Windows 官方版运行时升级脚本。补丁只修正扩展 bundle 中 `debug` 包的 save/load 函数；扩展标识、版本和其他打包内容保持不变。
 
 ## 生成指定历史版本
 
@@ -49,10 +49,34 @@ bash scripts/update-vscode-codex-ext.sh --version 26.917.62051
 
 脚本不修改 VSCode 设置，包括 terminal 环境变量。若已设置 `chatgpt.cliExecutable`，该路径会覆盖扩展默认入口；需要启动重试时可自行将其指向目标机器的 `~/.local/bin/codex_`。
 
+## Windows：升级 patched 扩展和官方 Codex
+
+在 **Windows 本机 PowerShell** 中执行下面一行（需要 Python 和 VS Code 的 `code` 命令已在 PATH 中；不要在 WSL 或 Remote-SSH 终端执行）：
+
+```powershell
+py -3 -c "import urllib.request;exec(compile(urllib.request.urlopen('https://raw.githubusercontent.com/TTTPOB/codex-vscode-env-patch/main/scripts/update_vscode_codex_windows.py').read(),'<codex-update>','exec'))"
+```
+
+脚本在内存中运行，无需保存脚本文件；下载的 VSIX 和官方包放在临时目录，结束后自动清理。它会安装本仓库最新 Windows patched VSIX，再从 `openai/codex` 最新正式 Release 下载完整 Windows Codex 包，直接替换扩展 `bin/windows-x86_64/` 或 `bin/windows-aarch64/` 中的运行时。不使用 Linux/NFS fork、wrapper 或符号链接，不修改 VS Code 设置。
+
+除了 `codex.exe`，也同步更新同版 code-mode host、ripgrep、Windows sandbox helpers 和包资源；将官方包的元数据调整为扩展的平铺布局，确保运行时能找到配套资源。这里的“最新”指官方最新**正式版**，即使扩展原来打包的是编号更高的 alpha 版，也会换成正式版。
+
+更新前结束正在运行的 Codex 任务。若 Windows 提示文件被占用，关闭 VS Code 后在独立 PowerShell 中重跑；脚本不会强制结束进程。完成后重新加载 VS Code 窗口，并关闭 Codex 扩展的自动更新，避免 Marketplace 覆盖。已有 `chatgpt.cliExecutable` 设置会覆盖扩展默认入口；如果希望使用这里更新的 bundle，请自行清除该设置。
+
+也可以从仓库运行脚本并覆盖 VS Code 命令或架构：
+
+```powershell
+py -3 scripts/update_vscode_codex_windows.py
+py -3 scripts/update_vscode_codex_windows.py --code code-insiders --arch x64
+```
+
+默认按 Windows 架构选择 x64/ARM64；ARM64 Windows 使用 x64 VS Code 时指定 `--arch x64`。自定义扩展目录可用 `--extensions-dir` 指定。
+
 ## 本地验证
 
 ```bash
 python3 patch_release.py --self-test
 python3 -m unittest test_patch_release.py
 python3 scripts/test_update_vscode_codex_ext.py
+python3 scripts/test_update_vscode_codex_windows.py
 ```
