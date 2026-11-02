@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Install a pre-patched VSIX and the latest independent NFS-fixed runtime.
+# Install a pre-patched VSIX and the latest official stable runtime.
 EXTENSION_REPO=TTTPOB/codex-vscode-env-patch
-FORK_REPO=TTTPOB/codex
+RUNTIME_REPO=openai/codex
 CODE_CMD="${CODE_CMD:-code}"
 LOCAL_BIN_DIR="${LOCAL_BIN_DIR:-$HOME/.local/bin}"
 EXTENSION_VERSION="${EXTENSION_VERSION:-}"
@@ -13,7 +13,7 @@ usage() {
         'Usage: update-vscode-codex-ext.sh [--version VERSION] [--help]' \
         'Download the patched linux-x64 VSIX from TTTPOB/codex-vscode-env-patch.' \
         'Without a version, use GitHub releases/latest. Never use Marketplace.' \
-        'Runtime: highest stable nfs-rust-vX.Y.Z release with a complete Codex package.' \
+        'Runtime: official openai/codex releases/latest complete Linux musl x64 package.' \
         'Overrides: EXTENSION_VERSION, CODE_CMD, LOCAL_BIN_DIR, EXTENSIONS_DIR,' \
         '           VSCODE_AGENT_FOLDER, TMPDIR, GH_TOKEN.' \
         'Reload the VS Code remote window after updating.'
@@ -103,55 +103,40 @@ with zipfile.ZipFile(sys.argv[1]) as archive:
     print(f'Extension version: {package["version"]}; bundled Codex (information only): {bundled}')
 PY
 
-# Paginate so unrelated/prerelease entries cannot hide a usable stable release.
-page=1
-while :; do
-    api "$FORK_REPO/releases?per_page=100&page=$page" > "$TMP_DIR/releases-$page.json"
-    count="$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))))' "$TMP_DIR/releases-$page.json")"
-    (( count == 100 )) || break
-    page=$((page + 1))
-done
-FORK_TAG="$(python3 - "$TMP_DIR" <<'PY'
-import glob, json, re, sys
-releases = []
-for path in glob.glob(sys.argv[1] + '/releases-*.json'):
-    for release in json.load(open(path)):
-        tag = release.get('tag_name', '')
-        if release.get('draft') or release.get('prerelease') or not re.fullmatch(r'nfs-rust-v\d+\.\d+\.\d+', tag):
-            continue
-        wanted = f'codex-{tag}-x86_64-unknown-linux-musl.tar.gz'
-        if any(a.get('name') == wanted for a in release.get('assets', [])):
-            releases.append(release)
-if not releases:
-    raise SystemExit('no stable NFS-fixed release with a musl x64 archive')
-latest = max(releases, key=lambda r: tuple(map(int, r['tag_name'][10:].split('.'))))
-print(latest['tag_name'])
-with open(sys.argv[1] + '/fork-release.json', 'w') as output:
-    json.dump(latest, output)
+# GitHub's latest endpoint selects the official stable release, not an alpha build.
+api "$RUNTIME_REPO/releases/latest" > "$TMP_DIR/runtime-release.json"
+RUNTIME_TAG="$(python3 - "$TMP_DIR/runtime-release.json" <<'PY'
+import json, re, sys
+release = json.load(open(sys.argv[1]))
+tag = release.get('tag_name', '')
+if release.get('draft') or release.get('prerelease') or not re.fullmatch(r'rust-v\d+\.\d+\.\d+', tag):
+    raise SystemExit('unexpected official stable runtime release tag')
+print(tag)
 PY
 )"
-CODEX_VERSION="${FORK_TAG#nfs-rust-v}"
-echo "NFS runtime: $FORK_TAG"
-asset_info="$(asset "$TMP_DIR/fork-release.json" "codex-${FORK_TAG}-x86_64-unknown-linux-musl.tar.gz")"
-IFS=$'\t' read -r fork_url fork_digest <<< "$asset_info"
-download_verified "$fork_url" "$fork_digest" "$TMP_DIR/fork.tar.gz"
-mkdir "$TMP_DIR/fork"
-tar -xzf "$TMP_DIR/fork.tar.gz" -C "$TMP_DIR/fork"
-PACKAGE_SOURCE="$TMP_DIR/fork"
+CODEX_VERSION="${RUNTIME_TAG#rust-v}"
+echo "Official runtime: $RUNTIME_TAG"
+asset_info="$(asset "$TMP_DIR/runtime-release.json" 'codex-package-x86_64-unknown-linux-musl.tar.gz')"
+IFS=$'\t' read -r runtime_url runtime_digest <<< "$asset_info"
+download_verified "$runtime_url" "$runtime_digest" "$TMP_DIR/runtime.tar.gz"
+mkdir "$TMP_DIR/runtime"
+tar -xzf "$TMP_DIR/runtime.tar.gz" -C "$TMP_DIR/runtime"
+PACKAGE_SOURCE="$TMP_DIR/runtime"
 [[ -f "$PACKAGE_SOURCE/codex-package.json" &&
    -f "$PACKAGE_SOURCE/bin/codex" &&
    -f "$PACKAGE_SOURCE/bin/codex-code-mode-host" &&
    -d "$PACKAGE_SOURCE/codex-path" &&
-   -d "$PACKAGE_SOURCE/codex-resources" ]] || die 'NFS archive must contain a complete Codex package (not standalone binaries)'
-FORK_BINARY="$PACKAGE_SOURCE/bin/codex"
+   -d "$PACKAGE_SOURCE/codex-resources" ]] || die 'Official archive must contain a complete Codex package (not standalone binaries)'
+RUNTIME_BINARY="$PACKAGE_SOURCE/bin/codex"
 HOST_BINARY="$PACKAGE_SOURCE/bin/codex-code-mode-host"
-chmod 0755 "$FORK_BINARY" "$HOST_BINARY"
-version_output="$("$FORK_BINARY" --version)"
+chmod 0755 "$RUNTIME_BINARY" "$HOST_BINARY"
+version_output="$("$RUNTIME_BINARY" --version)"
 [[ "$version_output" == "codex-cli $CODEX_VERSION" ]] || die "unexpected runtime version: $version_output"
+
 "$HOST_BINARY" --help >/dev/null 2>&1 || die 'code-mode host smoke test failed'
 
 LOCAL_BIN_DIR="$(realpath -m "$LOCAL_BIN_DIR")"
-PACKAGE_DIR="$LOCAL_BIN_DIR/codex-packages/$FORK_TAG"
+PACKAGE_DIR="$LOCAL_BIN_DIR/codex-packages/$RUNTIME_TAG"
 REAL_CODEX="$PACKAGE_DIR/bin/codex"
 RETRY_WRAPPER="$LOCAL_BIN_DIR/codex_"
 {

@@ -14,7 +14,7 @@ import zipfile
 SCRIPT = Path(__file__).with_name('update-vscode-codex-ext.sh')
 OLD = '26.917.62051'
 LATEST = '26.1000.1'
-RUNTIME = '0.153.4'
+RUNTIME = '0.166.0'
 
 CURL_MOCK = r'''#!/usr/bin/env python3
 import json, os, pathlib, shutil, sys
@@ -99,17 +99,11 @@ class UpdaterTest(unittest.TestCase):
             self.api['TTTPOB/codex-vscode-env-patch/releases/tags/' + release['tag_name']] = release
             if version == LATEST:
                 self.api['TTTPOB/codex-vscode-env-patch/releases/latest'] = release
-        fork_name = f'codex-nfs-rust-v{RUNTIME}-x86_64-unknown-linux-musl.tar.gz'
-        self.package(fork_name)
-        valid = {'tag_name': 'nfs-rust-v' + RUNTIME, 'published_at': '2026-09-20',
-                 'assets': [self.asset(fork_name)]}
-        older_name = 'codex-nfs-rust-v0.1.0-x86_64-unknown-linux-musl.tar.gz'
-        self.tar(older_name, 'codex', '#!/bin/sh\necho "codex-cli 0.1.0"\n')
-        older = {**valid, 'tag_name': 'nfs-rust-v0.1.0', 'published_at': '2026-01-01',
-                 'assets': [self.asset(older_name)]}
-        self.api['TTTPOB/codex/releases?per_page=100&page=1'] = [
-            {**valid, 'tag_name': 'rust-v9.0.0'}, {**valid, 'prerelease': True},
-            {**valid, 'draft': True}, older, valid]
+        runtime_name = 'codex-package-x86_64-unknown-linux-musl.tar.gz'
+        self.package(runtime_name)
+        self.api['openai/codex/releases/latest'] = {
+            'tag_name': 'rust-v' + RUNTIME, 'draft': False, 'prerelease': False,
+            'assets': [self.asset(runtime_name)]}
 
     def asset(self, name):
         digest = hashlib.sha256((self.root / 'assets' / name).read_bytes()).hexdigest()
@@ -130,6 +124,8 @@ class UpdaterTest(unittest.TestCase):
             'codex-package.json': json.dumps({'layoutVersion': 1, 'version': RUNTIME}),
             'codex-path/rg': 'fixture rg',
             'codex-resources/runtime-data': 'fixture resource',
+            'bin/codex-exec-server': 'fixture exec server',
+            'codex-resources/voice/runtime.json': '{}',
         }
         with tarfile.open(self.root / 'assets' / name, 'w:gz') as archive:
             for path, content in files.items():
@@ -169,9 +165,11 @@ class UpdaterTest(unittest.TestCase):
                                text=True, capture_output=True)
         self.assertEqual(probe.stdout.strip(), 'codex-cli ' + RUNTIME)
         self.assertEqual(probe.returncode, 0)
-        package = Path(self.env['LOCAL_BIN_DIR']) / 'codex-packages' / ('nfs-rust-v' + RUNTIME)
+        package = Path(self.env['LOCAL_BIN_DIR']) / 'codex-packages' / ('rust-v' + RUNTIME)
         self.assertEqual((Path(self.env['LOCAL_BIN_DIR']) / 'codex').resolve(), package / 'bin/codex')
         self.assertEqual(local_host.resolve(), package / 'bin/codex-code-mode-host')
+        self.assertEqual((package / 'bin/codex-exec-server').read_text(), 'fixture exec server')
+        self.assertEqual((package / 'codex-resources/voice/runtime.json').read_text(), '{}')
         self.assertEqual(json.loads((package / 'codex-package.json').read_text())['version'], RUNTIME)
         host_probe = subprocess.run([str(bundle / 'codex-code-mode-host'), '--help'], env=self.env,
                                     text=True, capture_output=True)
@@ -188,31 +186,59 @@ class UpdaterTest(unittest.TestCase):
         self.assert_success(self.run_update(), LATEST)
         requests = (self.root / 'requests').read_text()
         self.assertIn('codex-vscode-env-patch/releases/latest', requests)
-        self.assertNotIn('openai/codex/', requests)
+        self.assertIn('openai/codex/releases/latest', requests)
+        self.assertIn('codex-package-x86_64-unknown-linux-musl.tar.gz', requests)
+        self.assertNotIn('TTTPOB/codex/', requests)
         self.assertNotIn('rust-v0.1.0', requests)
 
-    def test_runtime_release_pagination(self):
-        key = 'TTTPOB/codex/releases?per_page=100&page=1'
-        valid = self.api[key][-1]
-        self.api[key] = [{**valid, 'prerelease': True}] * 100
-        self.api['TTTPOB/codex/releases?per_page=100&page=2'] = [valid]
-        self.assert_success(self.run_update(), LATEST)
-        self.assertIn('releases?per_page=100&page=2', (self.root / 'requests').read_text())
+    def test_unstable_or_invalid_runtime_rejected_before_install(self):
+        key = 'openai/codex/releases/latest'
+        valid = self.api[key].copy()
+        for changes in ({'prerelease': True}, {'draft': True},
+                        {'tag_name': 'rust-v0.167.0-alpha.1'},
+                        {'tag_name': 'nfs-rust-v' + RUNTIME}):
+            with self.subTest(changes=changes):
+                self.api[key] = {**valid, **changes}
+                result = self.run_update()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('official stable runtime release tag', result.stderr)
+                self.assertFalse((self.root / 'code-calls').exists())
+                self.assert_clean()
 
-    def test_runtime_version_not_publication_date(self):
-        key = 'TTTPOB/codex/releases?per_page=100&page=1'
-        self.api[key][-2]['published_at'] = '2099-01-01'
-        self.assert_success(self.run_update(), LATEST)
+    def test_missing_complete_package_has_no_fork_or_binary_fallback(self):
+        self.api['openai/codex/releases/latest']['assets'] = []
+        result = self.run_update()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('asset not found: codex-package-', result.stderr)
+        self.assertNotIn('TTTPOB/codex/', (self.root / 'requests').read_text())
+        self.assertFalse((self.root / 'code-calls').exists())
+        self.assert_clean()
 
     def test_bare_binary_archive_rejected_before_install(self):
-        name = f'codex-nfs-rust-v{RUNTIME}-x86_64-unknown-linux-musl.tar.gz'
+        name = 'codex-package-x86_64-unknown-linux-musl.tar.gz'
         self.tar(name, 'codex', '#!/bin/sh\nexit 0\n')
-        self.api['TTTPOB/codex/releases?per_page=100&page=1'][-1]['assets'] = [self.asset(name)]
+        self.api['openai/codex/releases/latest']['assets'] = [self.asset(name)]
         result = self.run_update()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('complete Codex package', result.stderr)
         self.assertFalse((self.root / 'code-calls').exists())
         self.assert_clean()
+
+    def test_existing_databases_and_fork_packages_are_preserved(self):
+        codex_home = self.root / 'home/.codex'
+        codex_home.mkdir()
+        originals = {'state_5.sqlite': b'existing WAL database',
+                     'state_5.sqlite-wal': b'pending WAL data',
+                     'state_5.sqlite-shm': b'existing shared memory'}
+        for name, content in originals.items():
+            (codex_home / name).write_bytes(content)
+        old_package = Path(self.env['LOCAL_BIN_DIR']) / 'codex-packages/nfs-rust-v0.153.4'
+        old_package.mkdir(parents=True)
+        (old_package / 'keep').write_text('old runtime')
+        self.assert_success(self.run_update(), LATEST)
+        for name, content in originals.items():
+            self.assertEqual((codex_home / name).read_bytes(), content)
+        self.assertEqual((old_package / 'keep').read_text(), 'old runtime')
 
     def test_environment_version(self):
         self.env['EXTENSION_VERSION'] = OLD
@@ -234,7 +260,7 @@ class UpdaterTest(unittest.TestCase):
                 self.assert_clean()
 
     def test_bad_runtime_digest_before_install(self):
-        self.api['TTTPOB/codex/releases?per_page=100&page=1'][-1]['assets'][0]['digest'] = 'sha256:' + '0' * 64
+        self.api['openai/codex/releases/latest']['assets'][0]['digest'] = 'sha256:' + '0' * 64
         result = self.run_update()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('SHA-256 mismatch', result.stderr)
